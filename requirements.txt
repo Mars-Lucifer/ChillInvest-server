@@ -1,10 +1,6 @@
---extra-index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
-
-fastapi>=0.100
-uvicorn[standard]>=0.22
-cryptography>=41
-bcrypt>=4.1.0
-pydantic>=2
-pydantic-settings>=2
+fastapi
+uvicorn
+bcrypt
+cryptography
+--index-url https://opensource.tbank.ru/api/v4/projects/238/packages/pypi/simple
 t-tech-investments
-
