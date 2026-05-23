@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import threading
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from typing import Any, Literal
 
@@ -221,6 +221,8 @@ def save_strategy_settings(
     payload: StrategyStartRequest,
 ) -> dict[str, Any]:
     now_iso = utc_now().isoformat()
+    target_date_iso = payload.target_date.isoformat() if payload.target_date else None
+    end_date = "бесконечно" if payload.infinite_run else target_date_iso
     connection = get_db_connection()
     try:
         connection.execute(
@@ -231,25 +233,31 @@ def save_strategy_settings(
                 infinite_run,
                 mode,
                 profit_reserve_percent,
+                profit_withdraw_percent,
+                end_date,
                 is_active,
                 updated_at,
                 started_by
             )
-            VALUES (1, ?, ?, ?, ?, 1, ?, ?)
+            VALUES (1, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 target_date = excluded.target_date,
                 infinite_run = excluded.infinite_run,
                 mode = excluded.mode,
                 profit_reserve_percent = excluded.profit_reserve_percent,
+                profit_withdraw_percent = excluded.profit_withdraw_percent,
+                end_date = excluded.end_date,
                 is_active = excluded.is_active,
                 updated_at = excluded.updated_at,
                 started_by = excluded.started_by
             """,
             (
-                payload.target_date.isoformat() if payload.target_date else None,
+                target_date_iso,
                 int(payload.infinite_run),
                 payload.mode,
                 float(payload.profit_reserve_percent),
+                float(payload.profit_reserve_percent),
+                end_date,
                 now_iso,
                 login,
             ),
@@ -267,7 +275,7 @@ def get_strategy_settings() -> dict[str, Any] | None:
         row = connection.execute(
             """
             SELECT id, target_date, infinite_run, mode, profit_reserve_percent,
-                   is_active, updated_at, started_by
+                   profit_withdraw_percent, end_date, is_active, updated_at, started_by
             FROM strategy_settings
             WHERE id = 1
             """
@@ -280,6 +288,8 @@ def get_strategy_settings() -> dict[str, Any] | None:
             "infinite_run": bool(row["infinite_run"]),
             "mode": row["mode"],
             "profit_reserve_percent": float(row["profit_reserve_percent"]),
+            "profit_withdraw_percent": float(row["profit_withdraw_percent"]),
+            "end_date": row["end_date"],
             "is_active": bool(row["is_active"]),
             "updated_at": row["updated_at"],
             "started_by": row["started_by"],
@@ -432,6 +442,15 @@ class TinkoffClient:
             return client.sandbox.get_sandbox_withdraw_limits(account_id=account_id)
         return client.operations.get_withdraw_limits(account_id=account_id)
 
+    def _get_orders_service(self, client: Any) -> Any:
+        return client.sandbox if self.sandbox else client.orders
+
+    def _get_stop_orders_service(self, client: Any) -> Any:
+        return client.sandbox if self.sandbox else client.stop_orders
+
+    def _get_operations_service(self, client: Any) -> Any:
+        return client.sandbox if self.sandbox else client.operations
+
     @log_execution
     def get_instrument_by_figi(self, figi: str) -> Any:
         with self._create_client() as client:
@@ -448,6 +467,153 @@ class TinkoffClient:
                 id=figi,
                 instrument_id=figi,
             )
+
+    @log_execution
+    def get_operations(
+        self,
+        from_dt: datetime | None = None,
+        to_dt: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Any]:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            operations_service = self._get_operations_service(client)
+            if from_dt is None:
+                from_dt = utc_now() - timedelta(days=365 * 5)
+            if to_dt is None:
+                to_dt = utc_now()
+
+            if self.sandbox:
+                response = call_with_supported_kwargs(
+                    operations_service,
+                    "get_sandbox_operations",
+                    account_id=account_id,
+                    from_=from_dt,
+                    to=to_dt,
+                )
+                return list(coalesce_attr(response, "operations", "items", default=[]))
+
+            response = call_with_supported_kwargs(
+                operations_service,
+                "get_operations",
+                account_id=account_id,
+                from_=from_dt,
+                to=to_dt,
+            )
+            return list(coalesce_attr(response, "operations", "items", default=[]))
+
+    @log_execution
+    def get_operations_by_cursor(
+        self,
+        from_dt: datetime | None = None,
+        to_dt: datetime | None = None,
+        limit: int = 100,
+    ) -> list[Any]:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            operations_service = self._get_operations_service(client)
+            if from_dt is None:
+                from_dt = utc_now() - timedelta(days=365 * 5)
+            if to_dt is None:
+                to_dt = utc_now()
+
+            if self.sandbox:
+                return self.get_operations(from_dt=from_dt, to_dt=to_dt, limit=limit)
+
+            cursor: str | None = None
+            collected: list[Any] = []
+            while len(collected) < limit:
+                response = call_with_supported_kwargs(
+                    operations_service,
+                    "get_operations_by_cursor",
+                    account_id=account_id,
+                    from_=from_dt,
+                    to=to_dt,
+                    cursor=cursor,
+                    limit=min(limit - len(collected), 1000),
+                )
+                items = list(coalesce_attr(response, "items", "operations", default=[]))
+                collected.extend(items)
+                has_next = bool(coalesce_attr(response, "has_next", default=False))
+                cursor = coalesce_attr(response, "next_cursor", default=None)
+                if not has_next or not cursor or not items:
+                    break
+            return collected[:limit]
+
+    @log_execution
+    def get_active_orders(self) -> list[Any]:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            order_service = self._get_orders_service(client)
+            method_name = "get_sandbox_orders" if self.sandbox else "get_orders"
+            response = call_with_supported_kwargs(order_service, method_name, account_id=account_id)
+            return list(getattr(response, "orders", []))
+
+    @log_execution
+    def cancel_order_by_id(self, order_id: str) -> None:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            order_service = self._get_orders_service(client)
+            method_name = "cancel_sandbox_order" if self.sandbox else "cancel_order"
+            call_with_supported_kwargs(
+                order_service,
+                method_name,
+                account_id=account_id,
+                order_id=order_id,
+            )
+
+    @log_execution
+    def get_active_stop_orders(self) -> list[Any]:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            stop_orders_service = self._get_stop_orders_service(client)
+            method_name = "get_sandbox_stop_orders" if self.sandbox else "get_stop_orders"
+            response = call_with_supported_kwargs(
+                stop_orders_service,
+                method_name,
+                account_id=account_id,
+            )
+            return list(getattr(response, "stop_orders", []))
+
+    @log_execution
+    def cancel_stop_order_by_id(self, stop_order_id: str) -> None:
+        with self._create_client() as client:
+            account_id = self._get_primary_account_id(client)
+            stop_orders_service = self._get_stop_orders_service(client)
+            method_name = "cancel_sandbox_stop_order" if self.sandbox else "cancel_stop_order"
+            call_with_supported_kwargs(
+                stop_orders_service,
+                method_name,
+                account_id=account_id,
+                stop_order_id=stop_order_id,
+            )
+
+    @log_execution
+    def cancel_all_active_orders(self) -> dict[str, int]:
+        cancelled_orders = 0
+        cancelled_stop_orders = 0
+
+        for order in self.get_active_orders():
+            order_id = coalesce_attr(order, "order_id", "id")
+            if not order_id:
+                continue
+            self.cancel_order_by_id(str(order_id))
+            cancelled_orders += 1
+
+        try:
+            for stop_order in self.get_active_stop_orders():
+                stop_order_id = coalesce_attr(stop_order, "stop_order_id", "id")
+                if not stop_order_id:
+                    continue
+                self.cancel_stop_order_by_id(str(stop_order_id))
+                cancelled_stop_orders += 1
+        except AttributeError:
+            logger.info("[MODE] Stop orders service is not available in current SDK build")
+
+        return {
+            "cancelled_orders": cancelled_orders,
+            "cancelled_stop_orders": cancelled_stop_orders,
+        }
 
     @check_avaria
     @log_execution
@@ -1374,6 +1540,21 @@ def maybe_replace_with_better_favorite(
     if sell_lots <= 0:
         return
     client.place_market_order(position["figi"], sell_lots, "sell")
+    average_purchase_price = get_average_purchase_price(position["figi"])
+    if average_purchase_price is not None:
+        realized_profit = quantize_money(
+            (Decimal(str(position["current_price"])) - average_purchase_price)
+            * Decimal(str(position["quantity"]))
+        )
+        if realized_profit > DECIMAL_ZERO:
+            from analytics import register_closed_position
+
+            register_closed_position(
+                profit=float(realized_profit),
+                is_coupon=False,
+                event_date=utc_now(),
+                title=f"Продажа {position['figi']}",
+            )
     log_event(
         logger,
         30,
@@ -1415,14 +1596,32 @@ def execute_trading_logic(mode: str, login: str, sandbox_mode: bool) -> dict[str
     total_amount = Decimal(str(balance["total_amount_rub"]))
     reserve_percent = Decimal(str(settings["profit_reserve_percent"]))
     reserved_cash = get_reserved_cash_amount(Decimal(str(balance["cash_rub"])), reserve_percent)
-    available_cash = max(Decimal(str(balance["cash_rub"])) - reserved_cash, DECIMAL_ZERO)
+    try:
+        from analytics import get_financial_reserves
+
+        financial_reserves = get_financial_reserves()
+    except Exception as error:  # pragma: no cover - defensive fallback
+        logger.warning("[MODE] Failed to load financial reserves, fallback to zero: %s", error)
+        financial_reserves = {
+            "virtual_tax_pool": 0.0,
+            "user_withdrawal_pool": 0.0,
+        }
+    locked_cash = quantize_money(
+        Decimal(str(financial_reserves["virtual_tax_pool"]))
+        + Decimal(str(financial_reserves["user_withdrawal_pool"]))
+    )
+    available_cash = max(
+        Decimal(str(balance["cash_rub"])) - reserved_cash - locked_cash,
+        DECIMAL_ZERO,
+    )
     allocations = calculate_allocations(balance["positions"], favorites, gold_figis, total_amount)
 
     logger.info(
-        "[MODE] Execute trading logic | mode=%s | cash=%s | reserved=%s | allocations=%s",
+        "[MODE] Execute trading logic | mode=%s | cash=%s | reserved=%s | locked=%s | allocations=%s",
         mode,
         available_cash,
         reserved_cash,
+        locked_cash,
         allocations,
     )
 

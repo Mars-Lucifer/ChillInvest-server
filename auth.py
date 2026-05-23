@@ -77,6 +77,74 @@ def initialize_database() -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS financial_reserves (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                virtual_tax_pool REAL NOT NULL DEFAULT 0,
+                user_withdrawal_pool REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS financial_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT UNIQUE,
+                event_kind TEXT NOT NULL,
+                title TEXT,
+                gross_profit REAL NOT NULL DEFAULT 0,
+                tax_reserved REAL NOT NULL DEFAULT 0,
+                net_profit REAL NOT NULL DEFAULT 0,
+                withdraw_reserved REAL NOT NULL DEFAULT 0,
+                reinvest_amount REAL NOT NULL DEFAULT 0,
+                is_coupon INTEGER NOT NULL DEFAULT 0,
+                event_date TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_date TEXT NOT NULL UNIQUE,
+                total_amount_rub REAL NOT NULL,
+                cash_rub REAL NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        strategy_settings_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(strategy_settings)")
+        }
+        if "profit_withdraw_percent" not in strategy_settings_columns:
+            connection.execute(
+                """
+                ALTER TABLE strategy_settings
+                ADD COLUMN profit_withdraw_percent REAL NOT NULL DEFAULT 0
+                """
+            )
+        if "end_date" not in strategy_settings_columns:
+            connection.execute(
+                """
+                ALTER TABLE strategy_settings
+                ADD COLUMN end_date TEXT
+                """
+            )
+        connection.execute(
+            """
+            INSERT INTO financial_reserves (
+                id,
+                virtual_tax_pool,
+                user_withdrawal_pool,
+                updated_at
+            )
+            VALUES (1, 0, 0, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO NOTHING
+            """
+        )
         connection.commit()
         logger.info("Транзакция initialize_database успешно завершена")
     finally:
